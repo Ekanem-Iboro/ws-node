@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "thermal-relay",
+  "main": "worker/src/index.js",
+  "compatibility_date": "2026-09-29",
+  "observability": {
+    "enabled": true
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "THERMAL_ROOM",
+        "class_name": "Room"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["Room"]
+    }
+  ]
+}
