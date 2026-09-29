@@ -2,16 +2,17 @@ const http = require('http');
 const express = require('express');
 const swaggerUi = require('swagger-ui-express');
 const { WebSocketServer } = require('ws');
-const { normalize, describe } = require('./shared/telemetry.js');
-const openapi = require('./shared/openapi.js').default;
+const { normalize, describe } = require('./shared/telemetry.mjs');
+const openapi = require('./shared/openapi.mjs').default;
+const { BASE_URL, WS_PATHS, deviceWsUrl, clientWsUrl } = require('./shared/config.mjs');
 
 // One HTTP server serves everything:
 //   REST   -> /api/*      (device pushes, frontend reads)
 //   Docs   -> /api-docs   (Swagger UI) and /api-docs.json
 //   WS     -> /ws/device  (ESP32-S3) and /ws/client (browser)
 const HTTP_PORT = Number(process.env.PORT) || 8080;
-const DEVICE_PATH = process.env.DEVICE_PATH || '/ws/device';
-const CLIENT_PATH = process.env.CLIENT_PATH || '/ws/client';
+const DEVICE_PATH = process.env.DEVICE_PATH || WS_PATHS.device;
+const CLIENT_PATH = process.env.CLIENT_PATH || WS_PATHS.client;
 
 // --- state ---------------------------------------------------------------
 let latest = null; // most recent telemetry payload
@@ -104,8 +105,11 @@ app.get('/api/telemetry/stream', (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'thermal-relay',
+    local: `http://localhost:${HTTP_PORT}`,
+    deployed: BASE_URL,
     rest: '/api/telemetry (GET latest, POST push), /api/health, /api/telemetry/stream (SSE)',
     websocket: { device: DEVICE_PATH, client: CLIENT_PATH },
+    deployedWebsocket: { device: deviceWsUrl(), client: clientWsUrl() },
     docs: '/api-docs',
   });
 });
@@ -173,11 +177,18 @@ for (const [name, wss] of [['Device', deviceWss], ['Client', clientWss]]) {
 }
 
 server.listen(HTTP_PORT, () => {
-  console.log(`\n  REST      -> http://localhost:${HTTP_PORT}/api/telemetry`);
-  console.log(`  SSE       -> http://localhost:${HTTP_PORT}/api/telemetry/stream`);
-  console.log(`  Swagger   -> http://localhost:${HTTP_PORT}/api-docs`);
-  console.log(`  ESP32-S3  -> ws://localhost:${HTTP_PORT}${DEVICE_PATH}`);
-  console.log(`  Frontend  -> ws://localhost:${HTTP_PORT}${CLIENT_PATH}\n`);
+  const local = `http://localhost:${HTTP_PORT}`;
+  console.log(`\n  Local server`);
+  console.log(`    REST      -> ${local}/api/telemetry`);
+  console.log(`    SSE       -> ${local}/api/telemetry/stream`);
+  console.log(`    Swagger   -> ${local}/api-docs`);
+  console.log(`    ESP32-S3  -> ws://localhost:${HTTP_PORT}${DEVICE_PATH}`);
+  console.log(`    Frontend  -> ws://localhost:${HTTP_PORT}${CLIENT_PATH}`);
+  console.log(`\n  Deployed (Cloudflare)`);
+  console.log(`    Base      -> ${BASE_URL}`);
+  console.log(`    REST      -> ${BASE_URL}/api/telemetry`);
+  console.log(`    ESP32-S3  -> ${deviceWsUrl()}`);
+  console.log(`    Frontend  -> ${clientWsUrl()}\n`);
 });
 
 process.on('SIGINT', () => {

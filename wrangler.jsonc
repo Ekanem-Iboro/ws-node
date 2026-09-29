@@ -1,6 +1,8 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "thermal-relay",
+  // Must match the deployed Worker name, otherwise `wrangler deploy` publishes a
+  // second Worker (and BASE_URL in shared/config.js goes stale).
+  "name": "ws-node",
   "main": "worker/src/index.js",
   "compatibility_date": "2026-09-29",
   "observability": {

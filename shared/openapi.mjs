@@ -1,5 +1,7 @@
 // OpenAPI 3.0 spec, shared by the local Node server and the Cloudflare Worker.
 // WebSocket handshakes can't be expressed in OpenAPI, so they live under x-websocket.
+import { BASE_URL, deviceWsUrl, clientWsUrl } from './config.mjs';
+
 export default {
   openapi: '3.0.3',
   info: {
@@ -21,7 +23,7 @@ export default {
   servers: [
     { url: 'http://localhost:8080', description: 'Local Node server' },
     { url: 'http://localhost:8787', description: 'Local wrangler dev' },
-    { url: 'https://thermal-relay.<your-subdomain>.workers.dev', description: 'Cloudflare Workers' },
+    { url: BASE_URL, description: 'Cloudflare Workers (deployed)' },
   ],
   tags: [
     { name: 'telemetry', description: 'Thermal readings pushed by the device and read by the frontend' },
@@ -150,6 +152,7 @@ export default {
     endpoints: {
       '/ws/device': {
         method: 'GET (HTTP Upgrade)',
+        url: deviceWsUrl(),
         role: 'ESP32-S3 pushes telemetry',
         serverHandshake: '101 Switching Protocols',
         send: { example: '{"ts":1790678801340,"thermal":{"max":68.4},"targets":[{"label":"Heater","value":68.4}]}' },
@@ -161,10 +164,12 @@ export default {
       },
       '/ws/client': {
         method: 'GET (HTTP Upgrade)',
+        url: clientWsUrl(),
         role: 'Frontend subscribes to telemetry',
         serverHandshake: '101 Switching Protocols',
         receives: 'Every accepted telemetry payload, as JSON text. The latest reading is replayed on connect.',
-        browserExample: "const ws = new WebSocket('ws://localhost:8080/ws/client');\nws.onmessage = (e) => console.log(JSON.parse(e.data));",
+        browserExample:
+          `const ws = new WebSocket('${clientWsUrl()}');\nws.onmessage = (e) => console.log(JSON.parse(e.data));`,
       },
     },
   },

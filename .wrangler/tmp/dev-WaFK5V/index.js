@@ -4,7 +4,7 @@ var __name = (target, value) => __defProp(target, "name", { value, configurable:
 // worker/src/room.js
 import { DurableObject } from "cloudflare:workers";
 
-// shared/telemetry.js
+// shared/telemetry.mjs
 function toNumberOrNull(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
@@ -158,7 +158,18 @@ function json(body, status = 200) {
 }
 __name(json, "json");
 
-// shared/openapi.js
+// shared/config.mjs
+var BASE_URL = "https://ws-node.sireemmy12.workers.dev";
+var WS_PATHS = {
+  device: "/ws/device",
+  // ESP32-S3 pushes telemetry here
+  client: "/ws/client"
+  // frontend subscribes here
+};
+var deviceWsUrl = /* @__PURE__ */ __name((base = BASE_URL) => `${base.replace(/^http/, "ws")}${WS_PATHS.device}`, "deviceWsUrl");
+var clientWsUrl = /* @__PURE__ */ __name((base = BASE_URL) => `${base.replace(/^http/, "ws")}${WS_PATHS.client}`, "clientWsUrl");
+
+// shared/openapi.mjs
 var openapi_default = {
   openapi: "3.0.3",
   info: {
@@ -180,7 +191,7 @@ var openapi_default = {
   servers: [
     { url: "http://localhost:8080", description: "Local Node server" },
     { url: "http://localhost:8787", description: "Local wrangler dev" },
-    { url: "https://thermal-relay.<your-subdomain>.workers.dev", description: "Cloudflare Workers" }
+    { url: BASE_URL, description: "Cloudflare Workers (deployed)" }
   ],
   tags: [
     { name: "telemetry", description: "Thermal readings pushed by the device and read by the frontend" },
@@ -308,6 +319,7 @@ var openapi_default = {
     endpoints: {
       "/ws/device": {
         method: "GET (HTTP Upgrade)",
+        url: deviceWsUrl(),
         role: "ESP32-S3 pushes telemetry",
         serverHandshake: "101 Switching Protocols",
         send: { example: '{"ts":1790678801340,"thermal":{"max":68.4},"targets":[{"label":"Heater","value":68.4}]}' },
@@ -319,10 +331,12 @@ var openapi_default = {
       },
       "/ws/client": {
         method: "GET (HTTP Upgrade)",
+        url: clientWsUrl(),
         role: "Frontend subscribes to telemetry",
         serverHandshake: "101 Switching Protocols",
         receives: "Every accepted telemetry payload, as JSON text. The latest reading is replayed on connect.",
-        browserExample: "const ws = new WebSocket('ws://localhost:8080/ws/client');\nws.onmessage = (e) => console.log(JSON.parse(e.data));"
+        browserExample: `const ws = new WebSocket('${clientWsUrl()}');
+ws.onmessage = (e) => console.log(JSON.parse(e.data));`
       }
     }
   }
@@ -330,8 +344,8 @@ var openapi_default = {
 
 // worker/src/index.js
 var ROOM_NAME = "thermal-relay";
-var DEVICE_PATH = "/ws/device";
-var CLIENT_PATH = "/ws/client";
+var DEVICE_PATH = WS_PATHS.device;
+var CLIENT_PATH = WS_PATHS.client;
 var DO_ORIGIN = "https://do.internal";
 var src_default = {
   // This Worker is a thin router: it does no state work of its own, it forwards
@@ -382,10 +396,11 @@ var src_default = {
       if (pathname === "/") {
         return json2({
           name: "thermal-relay (Cloudflare Worker)",
+          baseUrl: BASE_URL,
           rest: ["POST /api/telemetry", "GET /api/telemetry", "GET /api/health"],
-          websocket: { device: DEVICE_PATH, client: CLIENT_PATH },
+          websocket: { device: deviceWsUrl(), client: clientWsUrl() },
           sse: "not available on this runtime",
-          docs: "/api-docs"
+          docs: `${BASE_URL}/api-docs`
         });
       }
       return json2({ error: "Not found" }, 404);
@@ -497,7 +512,7 @@ var jsonError = /* @__PURE__ */ __name(async (request, env, _ctx, middlewareCtx)
 }, "jsonError");
 var middleware_miniflare3_json_error_default = jsonError;
 
-// .wrangler/tmp/bundle-WbIQHM/middleware-insertion-facade.js
+// .wrangler/tmp/bundle-A5EWUK/middleware-insertion-facade.js
 var __INTERNAL_WRANGLER_MIDDLEWARE__ = [
   middleware_ensure_req_body_drained_default,
   middleware_miniflare3_json_error_default
@@ -529,7 +544,7 @@ function __facade_invoke__(request, env, ctx, dispatch, finalMiddleware) {
 }
 __name(__facade_invoke__, "__facade_invoke__");
 
-// .wrangler/tmp/bundle-WbIQHM/middleware-loader.entry.ts
+// .wrangler/tmp/bundle-A5EWUK/middleware-loader.entry.ts
 var __Facade_ScheduledController__ = class ___Facade_ScheduledController__ {
   constructor(scheduledTime, cron, noRetry) {
     this.scheduledTime = scheduledTime;

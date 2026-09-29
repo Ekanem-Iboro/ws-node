@@ -1,11 +1,14 @@
 import { Room } from './room.js';
-import openapi from '../../shared/openapi.js';
+import openapi from '../../shared/openapi.mjs';
+import { BASE_URL, WS_PATHS, deviceWsUrl, clientWsUrl } from '../../shared/config.mjs';
 
 export { Room };
 
+// Independent of the Worker name in wrangler.jsonc: this is the id of the one Durable
+// Object instance that owns the sockets. Changing it would start a fresh empty room.
 const ROOM_NAME = 'thermal-relay';
-const DEVICE_PATH = '/ws/device';
-const CLIENT_PATH = '/ws/client';
+const DEVICE_PATH = WS_PATHS.device;
+const CLIENT_PATH = WS_PATHS.client;
 // Durable Object stubs only accept absolute URLs. The host is ignored; it is not a network hop.
 const DO_ORIGIN = 'https://do.internal';
 
@@ -71,10 +74,11 @@ export default {
       if (pathname === '/') {
         return json({
           name: 'thermal-relay (Cloudflare Worker)',
+          baseUrl: BASE_URL,
           rest: ['POST /api/telemetry', 'GET /api/telemetry', 'GET /api/health'],
-          websocket: { device: DEVICE_PATH, client: CLIENT_PATH },
+          websocket: { device: deviceWsUrl(), client: clientWsUrl() },
           sse: 'not available on this runtime',
-          docs: '/api-docs',
+          docs: `${BASE_URL}/api-docs`,
         });
       }
 

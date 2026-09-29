@@ -1,5 +1,9 @@
 # Deploying to Cloudflare
 
+Live URL: **https://ws-node.sireemmy12.workers.dev** (Worker name `ws-node`, set in
+`wrangler.jsonc`. The host string lives in `shared/config.js` as `BASE_URL` — change it there
+and the OpenAPI spec, the local banner, and the Worker info endpoint all follow.)
+
 Two builds share one payload contract and one OpenAPI spec:
 
 | | Local Node server | Cloudflare Worker |
@@ -7,20 +11,20 @@ Two builds share one payload contract and one OpenAPI spec:
 | Run | `npm start` | `npx wrangler deploy` |
 | Entry | `server.js` (Express + `ws`) | `worker/src/index.js` (router + Durable Object) |
 | State | in-process `latest` + `Set` of sockets | one Durable Object named `thermal-relay` |
-| Telemetry push | `ws://host:8080/ws/device` or `POST /api/telemetry` | `wss://<sub>.workers.dev/ws/device` or `POST /api/telemetry` |
-| Subscribe | `ws://host:8080/ws/client`, SSE, or polling | `wss://<sub>.workers.dev/ws/client` or polling |
-| Docs | `http://localhost:8080/api-docs` | `https://<sub>.workers.dev/api-docs` |
+| Telemetry push | `ws://localhost:8080/ws/device` or `POST /api/telemetry` | `wss://ws-node.sireemmy12.workers.dev/ws/device` or `POST /api/telemetry` |
+| Subscribe | `ws://localhost:8080/ws/client`, SSE, or polling | `wss://ws-node.sireemmy12.workers.dev/ws/client` or polling |
+| Docs | `http://localhost:8080/api-docs` | `https://ws-node.sireemmy12.workers.dev/api-docs` |
 | SSE | supported | **501** (a long-lived response pins a live isolate) |
 
-`shared/telemetry.js` and `shared/openapi.js` are imported by both, so normalization and
-docs can never drift between them.
+`shared/telemetry.js`, `shared/openapi.js`, and `shared/config.js` are imported by both, so
+normalization, docs, and URLs cannot drift between them.
 
 ## Why a Durable Object
 
 Workers are ephemeral and share no memory between isolates. The device socket and every
-subscriber socket can land in different isolates, so an in-memory `Set` cannot fan out and
-a `latest` variable disappears between requests. Routing everything to one DO instance
-gives a single point of coordination: it owns the sockets and persists the last reading to
+subscriber socket can land in different isolates, so an in-memory `Set` cannot fan out and a
+`latest` variable disappears between requests. Routing everything to one DO instance gives a
+single point of coordination: it owns the sockets and persists the last reading to
 SQLite-backed storage. Sockets are accepted with `ctx.acceptWebSocket()`, so when the object
 is idle it hibernates and idle connections cost nothing; it wakes on the next reading.
 
@@ -28,21 +32,21 @@ is idle it hibernates and idle connections cost nothing; it wakes on the next re
 
 ```bash
 npx wrangler login          # opens a browser, one-time
-npx wrangler deploy
+npx wrangler deploy         # publishes to https://ws-node.sireemmy12.workers.dev
 ```
 
-You get `https://thermal-relay.<your-subdomain>.workers.dev`. Verify:
+Verify:
 
 ```bash
-curl https://thermal-relay.<sub>.workers.dev/api/health
-npx wscat -c wss://thermal-relay.<sub>.workers.dev/ws/client
-npx wscat -c wss://thermal-relay.<sub>.workers.dev/ws/device
+curl https://ws-node.sireemmy12.workers.dev/api/health
+npx wscat -c wss://ws-node.sireemmy12.workers.dev/ws/client
+npx wscat -c wss://ws-node.sireemmy12.workers.dev/ws/device
 ```
 
 Then push a reading and watch it appear in the client tab:
 
 ```bash
-curl -X POST https://thermal-relay.<sub>.workers.dev/api/telemetry \
+curl -X POST https://ws-node.sireemmy12.workers.dev/api/telemetry \
   -H "Content-Type: application/json" \
   -d '{"ts":1790678801340,"thermal":{"max":68.4},"targets":[{"label":"Heater","value":68.4}]}'
 ```
@@ -52,8 +56,8 @@ Iterate with `npm run cf:dev` (local workerd on :8787, no account needed) and
 
 ## Point the device and frontend at it
 
-ESP32-S3: `ws://<ip>:8080` becomes `wss://thermal-relay.<sub>.workers.dev/ws/device`.
-The device sends the same JSON it always did:
+ESP32-S3: `ws://<ip>:8080` becomes `wss://ws-node.sireemmy12.workers.dev/ws/device`. The
+device sends the same JSON it always did:
 
 ```json
 {"ts": 1790678801340, "thermal": {"max": 68.4}, "targets": [{"label": "Heater", "value": 68.4}]}
@@ -62,7 +66,7 @@ The device sends the same JSON it always did:
 Frontend:
 
 ```js
-const ws = new WebSocket('wss://thermal-relay.<sub>.workers.dev/ws/client');
+const ws = new WebSocket('wss://ws-node.sireemmy12.workers.dev/ws/client');
 ws.onmessage = (e) => render(JSON.parse(e.data));
 ```
 
@@ -73,6 +77,7 @@ Notes:
   the host root keeps working.
 - The stored reading is replayed to each subscriber the moment it connects, so a page load
   renders the current temperature without waiting for the next sample.
+- Nothing to configure on the `workers.dev` host: TLS is automatic and ports are 443 only.
 
 ## Free plan limits that matter here
 
@@ -96,5 +101,5 @@ work. Nothing here needs the $5 plan unless you raise the sample rate.
 - The Swagger page pulls Swagger UI from unpkg, so `workers.dev` needs no extra setup. If
   you later add a custom domain and want offline docs, vendor the assets.
 - The DO name is fixed (`idFromName('thermal-relay')`), so every reader and writer shares
-  one room. If you want per-device isolation, change `ROOM_NAME` to a name derived from a
-  query param or header.
+  one room. If you want per-device isolation, derive `ROOM_NAME` in `worker/src/index.js`
+  from a query param or header instead.

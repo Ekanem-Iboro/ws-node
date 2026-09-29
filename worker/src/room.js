@@ -1,5 +1,5 @@
 import { DurableObject } from 'cloudflare:workers';
-import { normalize, describe } from '../../shared/telemetry.js';
+import { normalize, describe } from '../../shared/telemetry.mjs';
 
 const LAST_KEY = 'telemetry:latest';
 
