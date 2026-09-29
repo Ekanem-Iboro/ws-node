@@ -1,6 +1,6 @@
 // OpenAPI 3.0 spec, shared by the local Node server and the Cloudflare Worker.
 // WebSocket handshakes can't be expressed in OpenAPI, so they live under x-websocket.
-import { BASE_URL, deviceWsUrl, clientWsUrl } from './config.mjs';
+import { BASE_URL, WS_PATHS, deviceWsUrl, clientWsUrl, updatesWsUrl } from './config.mjs';
 
 // A WebSocket handshake cannot be expressed in OpenAPI, but Swagger UI will happily render
 // a GET operation with a documented 101 response, which is what a reader needs to see.
@@ -42,29 +42,39 @@ export default {
     description: [
       'Relay between an ESP32-S3 thermal sensor and a web frontend.',
       '',
-      '### The frontend pushes too',
-      '`/ws/client` is bidirectional. The browser sends a payload and it is ingested exactly like a reading from the ESP32:',
-      'stored as the latest value and broadcast to every other frontend socket. This mirrors the original',
-      '`wss.on(\'message\')` script, which never distinguished who sent what.',
+      '### Publish and observe are separate sockets',
+      'A socket either **publishes** a reading or **observes** them, never both. That is what stops a',
+      'publisher from seeing an echo of its own message:',
       '',
       '```js',
-      "const ws = new WebSocket('" + clientWsUrl() + "');",
-      'ws.onmessage = (e) => render(JSON.parse(e.data));',
-      "ws.send(JSON.stringify({ thermal: { max: 68.4 }, targets: [{ label: 'Heater', value: 68.4 }] }));",
+      "// publish on /ws/client - no echo comes back",
+      "const pub = new WebSocket('" + clientWsUrl() + "');",
+      "pub.send(JSON.stringify({ thermal: { max: 68.4 }, targets: [{ label: 'Heater', value: 68.4 }] }));",
+      '',
+      "// observe on /ws/updates - receives every accepted reading, from any publisher",
+      "const feed = new WebSocket('" + updatesWsUrl() + "');",
+      'feed.onmessage = (e) => render(JSON.parse(e.data));',
       '```',
       '',
+      'Anything sent on `/ws/updates` is refused: the socket is closed with code 4003 and the',
+      'stored value is left untouched. An observer can therefore never corrupt the feed.',
+      '',
+      'This mirrors the original `wss.on(\'message\')` script, which never distinguished who sent what -',
+      'a payload from a browser is ingested exactly like a reading from the ESP32.',
+      '',
       '### Data flow',
-      '1. A reading arrives from the ESP32-S3 (`/ws/device`), from the frontend (`/ws/client`), or from an HTTP POST (`POST /api/telemetry`).',
-      '2. The server normalizes it, stores it as the latest reading, and fans it out to every frontend socket and SSE subscriber.',
-      '3. Frontends receive them on `/ws/client`, or read the latest value with `GET /api/telemetry` when they cannot hold a connection.',
+      '1. A reading is published by the ESP32-S3 (`/ws/device`), by a browser (`/ws/client`), or over HTTP (`POST /api/telemetry`).',
+      '2. The server normalizes it, stores it as the latest reading, and fans it out to every observer socket and SSE subscriber.',
+      '3. Observers receive it on `/ws/updates`, or read the latest value with `GET /api/telemetry` when they cannot hold a connection.',
       '',
       '### Which socket to use',
-      '- `/ws/client` - the frontend. Pushes **and** receives. Use this one.',
-      '- `/ws/device` - the ESP32-S3. Pushes, does not receive, so the sensor never sees an echo. Exclusive: a new device socket closes the previous one with code 4000.',
-      '- `/` - a relay socket, kept for compatibility with the original `new WebSocket(\'ws://host:8080\')`. Pushes and receives, and never evicts the sensor.',
+      '- `/ws/updates` - **read-only observer.** Receives every accepted reading. Use this one to display data.',
+      '- `/ws/client` - **browser publisher.** Pushes only; it receives nothing back, not even its own messages.',
+      '- `/ws/device` - the ESP32-S3. Publishes only, same as `/ws/client`. Exclusive: a new device socket closes the previous one with code 4000.',
+      '- `/` or `/ws/relay` - the one exception: publishes **and** observes. Kept for the original `new WebSocket(\'ws://host:8080\')`, and it never evicts the sensor.',
       '',
       '### Hosting notes',
-      'The Cloudflare Worker build (`worker/`) routes everything through one Durable Object named `thermal-relay`, which owns the client sockets and the stored reading so fan-out survives multiple isolates. On Workers the SSE endpoint is not available (it would pin a live isolate); use the WebSocket there.',
+      'The Cloudflare Worker build (`worker/`) routes everything through one Durable Object named `thermal-relay`, which owns the sockets and the stored reading so fan-out survives multiple isolates. On Workers the SSE endpoint is not available (it would pin a live isolate); use the WebSocket there.',
     ].join('\n'),
   },
   servers: [
@@ -73,7 +83,7 @@ export default {
     { url: BASE_URL, description: 'Cloudflare Workers (deployed)' },
   ],
   tags: [
-    { name: 'websocket', description: 'WebSocket endpoints: the ESP32-S3 and the frontend both push here' },
+    { name: 'websocket', description: 'WebSocket endpoints. Sockets either publish a reading or observe them, never both.' },
     { name: 'telemetry', description: 'Thermal readings pushed by the device and read by the frontend' },
     { name: 'health', description: 'Server and connection status' },
   ],
@@ -91,12 +101,23 @@ export default {
                   type: 'object',
                   properties: {
                     status: { type: 'string', example: 'ok' },
-                    deviceConnected: { type: 'boolean' },
+                    deviceConnected: { type: 'boolean', description: 'True while an ESP32-S3 holds the /ws/device slot' },
+                    publishers: {
+                      type: 'object',
+                      description: 'Sockets that may push. Counted but never sent data.',
+                      properties: {
+                        device: { type: 'integer' },
+                        client: { type: 'integer' },
+                      },
+                    },
                     subscribers: {
                       type: 'object',
+                      description: 'Read-only observers receiving the broadcast',
                       properties: {
-                        websocket: { type: 'integer' },
-                        sse: { type: 'integer' },
+                        websocket: { type: 'integer', description: 'Total observer WebSockets' },
+                        updates: { type: 'integer', description: 'Sockets on /ws/updates' },
+                        relay: { type: 'integer' },
+                        sse: { type: 'integer', description: 'Always 0 on Cloudflare, which does not support SSE' },
                       },
                     },
                     latestAt: { type: 'integer', nullable: true, description: 'Epoch ms of last reading' },
@@ -152,24 +173,44 @@ export default {
         },
       },
     },
-    '/ws/client': wsOperation({
-      summary: 'Frontend socket: push and receive telemetry',
-      url: clientWsUrl(),
-      role: 'Browser frontend. Sends a payload to publish it, and receives every accepted reading.',
-      sends: 'Anything with a `thermal` field is stored as the latest reading and broadcast to all other frontend sockets.',
-      receives: 'Every accepted reading. The stored reading is replayed on connect.',
+    '/ws/updates': wsOperation({
+      summary: 'Observer socket: read-only feed of every accepted reading',
+      url: updatesWsUrl(),
+      role: '**Read-only.** Receives every accepted reading, from the ESP32-S3, from browsers, and from HTTP posts. Cannot publish.',
+      sends: 'Nothing. Anything sent here is refused: the socket is closed with code 4003 and the stored value is left untouched.',
+      receives: 'Every accepted reading as JSON text. The last stored reading is replayed on connect, so a page renders before the next sample arrives.',
       example:
-        "const ws = new WebSocket('" + clientWsUrl() + "');\n" +
-        'ws.onmessage = (e) => render(JSON.parse(e.data));\n' +
-        "ws.send(JSON.stringify({ thermal: { max: 68.4 }, targets: [{ label: 'Heater', value: 68.4 }] }));",
+        "const feed = new WebSocket('" + updatesWsUrl() + "');\n" +
+        'feed.onmessage = (e) => render(JSON.parse(e.data));\n' +
+        'feed.onopen = () => console.log("listening");',
       tags: ['websocket'],
+      notes: [
+        'This is the socket to use for anything that displays data. Open as many as you like; none of them evict each other.',
+        'A reading is only ever overwritten by a publisher, so an observer can never corrupt the feed.',
+      ],
+    }),
+    '/ws/client': wsOperation({
+      summary: 'Client publisher socket: push telemetry',
+      url: clientWsUrl(),
+      role: '**Publisher.** A browser pushes readings here. Receives nothing back, so it never sees an echo of its own message.',
+      sends: 'A telemetry object: { "ts": <ms>, "thermal": { "max": <number> }, "targets": [ { "label": "...", "value": <number> } ] }',
+      receives: 'Nothing. To display data, open a second socket on /ws/updates.',
+      example:
+        "const pub = new WebSocket('" + clientWsUrl() + "');\n" +
+        'pub.onopen = () =>\n' +
+        "  pub.send(JSON.stringify({ thermal: { max: 68.4 }, targets: [{ label: 'Heater', value: 68.4 }] }));",
+      tags: ['websocket'],
+      notes: [
+        'A payload sent here is stored as the latest reading and broadcast to every observer, exactly like a reading from the ESP32-S3.',
+        'send() is silently dropped while the socket is still CONNECTING. Wait for onopen, or check `readyState === 1`.',
+      ],
     }),
     '/ws/device': wsOperation({
       summary: 'ESP32-S3 socket: push telemetry',
       url: deviceWsUrl(),
-      role: 'The sensor. Sends readings; does not receive the broadcast, so it never sees an echo of its own data.',
+      role: 'The sensor. Publishes readings; receives nothing, so it never sees an echo of its own data.',
       sends: 'A telemetry object: { "ts": <ms>, "thermal": { "max": <number> }, "targets": [ { "label": "...", "value": <number> } ] }',
-      receives: 'Nothing. Device sockets are push-only.',
+      receives: 'Nothing. Device sockets are publish-only.',
       example:
         '// ESP32 / Arduino\n' +
         'WebSocketClient ws("' + deviceWsUrl() + '");\n' +
@@ -178,7 +219,7 @@ export default {
       tags: ['websocket'],
       notes: [
         'Connecting a second device socket closes the first with code 4000, so the sensor slot stays exclusive.',
-        'A bare upgrade to / is accepted as a general relay socket and does not evict the device.',
+        'A bare upgrade to / is accepted as a relay socket and does not evict the device.',
       ],
     }),
     '/api/telemetry/stream': {
@@ -228,28 +269,40 @@ export default {
   // vendor extensions, which is why those same endpoints are also declared in `paths`.
   'x-websocket': {
     note: 'WebSocket endpoints are declared under `paths` as GET operations with a 101 response, because vendor extensions are not rendered by Swagger UI. This block is the machine-readable duplicate.',
+    principle: 'A socket either publishes or observes, never both, so no publisher sees an echo of its own message.',
     endpoints: {
+      '/ws/updates': {
+        url: updatesWsUrl(),
+        role: 'Observer',
+        publishes: false,
+        receivesBroadcast: true,
+        sends: 'Nothing; a push is refused with close code 4003 and the stored value is untouched.',
+        receives: 'Every accepted reading; the stored reading is replayed on connect.',
+      },
       '/ws/client': {
         url: clientWsUrl(),
-        role: 'Frontend',
-        bidirectional: true,
-        sends: 'Telemetry object; stored as latest and broadcast to other frontends.',
-        receives: 'Every accepted reading; the stored reading is replayed on connect.',
+        role: 'Browser publisher',
+        publishes: true,
+        receivesBroadcast: false,
+        sends: 'Telemetry object; stored as latest and broadcast to every observer.',
+        receives: 'Nothing.',
       },
       '/ws/device': {
         url: deviceWsUrl(),
         role: 'ESP32-S3',
-        bidirectional: false,
+        publishes: true,
+        receivesBroadcast: false,
         sends: 'Telemetry object.',
         receives: 'Nothing. Exclusive slot: a second device closes the first with code 4000.',
       },
-      '/': {
-        url: BASE_URL.replace(/^http/, 'ws') + '/',
+      '/ws/relay': {
+        url: BASE_URL.replace(/^http/, 'ws') + WS_PATHS.relay,
         role: 'Relay (legacy path from the original script)',
-        bidirectional: true,
+        publishes: true,
+        receivesBroadcast: true,
         sends: 'Telemetry object.',
         receives: 'Every accepted reading.',
-        note: 'Never evicts the device socket.',
+        note: 'The only socket that does both. Never evicts the device socket. Same behaviour on the bare "/" path.',
       },
     },
   },

@@ -1,6 +1,6 @@
 import { Room } from './room.js';
 import openapi from '../../shared/openapi.mjs';
-import { BASE_URL, WS_PATHS, deviceWsUrl, clientWsUrl } from '../../shared/config.mjs';
+import { BASE_URL, WS_PATHS, deviceWsUrl, clientWsUrl, updatesWsUrl } from '../../shared/config.mjs';
 
 export { Room };
 
@@ -16,12 +16,13 @@ const DO_ORIGIN = 'https://do.internal';
 const WS_ROLE_BY_PATH = {
   [WS_PATHS.device]: '/ws/device',
   [WS_PATHS.client]: '/ws/client',
+  [WS_PATHS.updates]: '/ws/updates',
   [WS_PATHS.relay]: '/ws/relay',
   '/': '/ws/relay',
 };
 
 // Paths that only ever answer WebSocket upgrades, so a plain GET should return 426.
-const WS_ONLY_PATHS = [WS_PATHS.device, WS_PATHS.client, WS_PATHS.relay];
+const WS_ONLY_PATHS = [WS_PATHS.device, WS_PATHS.client, WS_PATHS.updates, WS_PATHS.relay];
 
 function wsUrlFor(pathname) {
   const base = BASE_URL.replace(/^http/, 'ws');
@@ -102,7 +103,10 @@ export default {
           name: 'thermal-relay (Cloudflare Worker)',
           baseUrl: BASE_URL,
           rest: ['POST /api/telemetry', 'GET /api/telemetry', 'GET /api/health'],
-          websocket: { device: deviceWsUrl(), client: clientWsUrl() },
+          websocket: {
+            publish: { device: deviceWsUrl(), client: clientWsUrl() },
+            observe: { updates: updatesWsUrl() },
+          },
           sse: 'not available on this runtime',
           docs: `${BASE_URL}/api-docs`,
         });

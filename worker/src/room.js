@@ -3,16 +3,17 @@ import { normalize, describe } from '../../shared/telemetry.mjs';
 
 const LAST_KEY = 'telemetry:latest';
 
-// Roles decide what a socket may do, not whether it can send. All three can push; the
-// difference is who receives the broadcast and whether the socket evicts an earlier one.
-//   device - ESP32-S3. Push telemetry. Does not receive the broadcast (no echo).
-//   client - browser frontend. Pushes and receives everything.
-//   relay  - the bare '/' path from the original script: pushes and receives everything,
-//            and never evicts, so a frontend pasting ws://<host>/ cannot kick the sensor.
+// Roles decide what a socket may do. A socket either publishes or observes, never both.
+//   device  - ESP32-S3. Publishes only. Does not receive (no echo of its own reading).
+//   client  - browser publisher. Publishes only; its own pushes do not come back to it.
+//   relay   - the bare '/' path from the original script. Publishes and observes, and never
+//             evicts, so a frontend pasting ws://<host>/ cannot kick the sensor.
+//   updates - read-only observer. Receives every accepted reading and cannot corrupt state.
 const ROLES = {
-  device: { receivesBroadcast: false },
-  client: { receivesBroadcast: true },
-  relay: { receivesBroadcast: true },
+  device: { publishes: true, receivesBroadcast: false },
+  client: { publishes: true, receivesBroadcast: false },
+  relay: { publishes: true, receivesBroadcast: true },
+  updates: { publishes: false, receivesBroadcast: true },
 };
 
 // One instance of this class is the whole relay: it holds the device socket, every
@@ -39,6 +40,8 @@ export class Room extends DurableObject {
         return this.acceptSocket(request, 'client');
       case '/ws/relay':
         return this.acceptSocket(request, 'relay');
+      case '/ws/updates':
+        return this.acceptSocket(request, 'updates');
       case '/ingest':
         return request.method === 'POST' ? this.ingestViaHttp(request) : json({ error: 'Method not allowed' }, 405);
       case '/latest':
@@ -48,9 +51,14 @@ export class Room extends DurableObject {
           status: 'ok',
           runtime: 'cloudflare-worker',
           deviceConnected: this.ctx.getWebSockets('device').length > 0,
+          publishers: {
+            device: this.ctx.getWebSockets('device').length,
+            client: this.ctx.getWebSockets('client').length,
+          },
           subscribers: {
             websocket: this.subscriberCount(),
-            device: this.ctx.getWebSockets('device').length,
+            updates: this.ctx.getWebSockets('updates').length,
+            relay: this.ctx.getWebSockets('relay').length,
             sse: 0,
           },
           latestAt: this.latestAt,
@@ -87,7 +95,8 @@ export class Room extends DurableObject {
     server.serializeAttachment({ role, connectedAt: Date.now() });
 
     console.log(`${LABELS[role]} connected.`);
-    // Replay the stored reading so a page renders before the next sample arrives.
+    // Replay the stored reading so an observer renders before the next sample arrives.
+    // A publisher gets nothing back, so it never sees an echo of what it just sent.
     if (ROLES[role].receivesBroadcast && this.latest) server.send(JSON.stringify(this.latest));
 
     return new Response(null, { status: 101, webSocket: client });
@@ -108,11 +117,11 @@ export class Room extends DurableObject {
     return json({ accepted: true, ts: payload.ts }, 202);
   }
 
-  // Every socket that receives the broadcast: the frontends, not the sensor (so the ESP32
-  // never sees an echo of its own reading).
+  // Every socket that receives the broadcast: the observers. Publishers are excluded, so a
+  // socket never sees an echo of its own message.
   broadcastTargets() {
     return [
-      ...this.ctx.getWebSockets('client'),
+      ...this.ctx.getWebSockets('updates'),
       ...this.ctx.getWebSockets('relay'),
     ];
   }
@@ -144,26 +153,35 @@ export class Room extends DurableObject {
   }
 
   // --- hibernation event handlers ----------------------------------------
-  // Push path. Any role may send: the ESP32 and the frontend are treated identically,
-  // which is what the original `wss.on('message')` script did.
+  // Publish path. A socket whose role allows publishing is ingested exactly like the
+  // original `wss.on('message')` script: parse, normalize, store, broadcast.
   async webSocketMessage(ws, message) {
     const { role } = ws.deserializeAttachment() ?? {};
+    const label = LABELS[role] ?? 'Socket';
+
+    // A read-only observer cannot corrupt state, so refuse instead of ingesting. Close the
+    // socket so the mistake is obvious on the client rather than silently ignored forever.
+    if (!ROLES[role]?.publishes) {
+      console.error(`${label} is read-only and cannot push; closing.`);
+      ws.close(4003, 'this endpoint is read-only');
+      return;
+    }
 
     const raw = typeof message === 'string' ? message : new TextDecoder().decode(message);
     let parsed;
     try {
       parsed = JSON.parse(raw);
     } catch {
-      console.error(`Invalid JSON from ${LABELS[role] ?? 'socket'}:`, raw.slice(0, 200));
+      console.error(`Invalid JSON from ${label}:`, raw.slice(0, 200));
       return;
     }
 
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      console.error(`Non-object payload from ${LABELS[role] ?? 'socket'}:`, raw.slice(0, 200));
+      console.error(`Non-object payload from ${label}:`, raw.slice(0, 200));
       return;
     }
 
-    await this.ingest(parsed, `${LABELS[role] ?? 'socket'} socket`);
+    await this.ingest(parsed, `${label} socket`);
   }
 
   async webSocketClose(ws, code) {
@@ -189,8 +207,9 @@ export class Room extends DurableObject {
 
 const LABELS = {
   device: 'ESP32-S3',
-  client: 'Frontend',
+  client: 'Client publisher',
   relay: 'Relay client',
+  updates: 'Observer',
 };
 
 function json(body, status = 200) {

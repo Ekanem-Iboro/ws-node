@@ -11,12 +11,12 @@ Two builds share one payload contract and one OpenAPI spec:
 | Run | `npm start` | `npx wrangler deploy` |
 | Entry | `server.js` (Express + `ws`) | `worker/src/index.js` (router + Durable Object) |
 | State | in-process `latest` + `Set` of sockets | one Durable Object named `thermal-relay` |
-| Telemetry push | `ws://localhost:8080/ws/device` or `POST /api/telemetry` | `wss://ws-node.sireemmy12.workers.dev/ws/device` or `POST /api/telemetry` |
-| Subscribe | `ws://localhost:8080/ws/client`, SSE, or polling | `wss://ws-node.sireemmy12.workers.dev/ws/client` or polling |
+| Telemetry push | `ws://localhost:8080/ws/device`, `ws://localhost:8080/ws/client`, or `POST /api/telemetry` | same, on `wss://ws-node.sireemmy12.workers.dev` |
+| Subscribe | `ws://localhost:8080/ws/updates`, SSE, or polling | `wss://ws-node.sireemmy12.workers.dev/ws/updates` or polling |
 | Docs | `http://localhost:8080/api-docs` | `https://ws-node.sireemmy12.workers.dev/api-docs` |
 | SSE | supported | **501** (a long-lived response pins a live isolate) |
 
-`shared/telemetry.js`, `shared/openapi.js`, and `shared/config.js` are imported by both, so
+`shared/telemetry.mjs`, `shared/openapi.mjs`, and `shared/config.mjs` are imported by both, so
 normalization, docs, and URLs cannot drift between them.
 
 ## Why a Durable Object
@@ -39,11 +39,11 @@ Verify:
 
 ```bash
 curl https://ws-node.sireemmy12.workers.dev/api/health
-npx wscat -c wss://ws-node.sireemmy12.workers.dev/ws/client
-npx wscat -c wss://ws-node.sireemmy12.workers.dev/ws/device
+npx wscat -c wss://ws-node.sireemmy12.workers.dev/ws/updates   # observer
+npx wscat -c wss://ws-node.sireemmy12.workers.dev/ws/device    # publisher
 ```
 
-Then push a reading and watch it appear in the client tab:
+Then push a reading and watch it appear in the observer tab:
 
 ```bash
 curl -X POST https://ws-node.sireemmy12.workers.dev/api/telemetry \
@@ -63,30 +63,36 @@ device sends the same JSON it always did:
 {"ts": 1790678801340, "thermal": {"max": 68.4}, "targets": [{"label": "Heater", "value": 68.4}]}
 ```
 
-Frontend — this socket both **pushes and receives**:
+Frontend — two sockets, because publishing and observing are separate:
 
 ```js
-const ws = new WebSocket('wss://ws-node.sireemmy12.workers.dev/ws/client');
+// observe: read-only feed of every accepted reading
+const feed = new WebSocket('wss://ws-node.sireemmy12.workers.dev/ws/updates');
+feed.onmessage = (e) => render(JSON.parse(e.data));
 
-// receive: every accepted reading, from the ESP32 and from other frontends
-ws.onmessage = (e) => render(JSON.parse(e.data));
-
-// push: sent payloads are stored as the latest reading and broadcast to the others
-ws.send(JSON.stringify({ thermal: { max: 68.4 }, targets: [{ label: 'Heater', value: 68.4 }] }));
+// publish: payloads are stored as the latest reading and fanned out to every observer
+const pub = new WebSocket('wss://ws-node.sireemmy12.workers.dev/ws/client');
+pub.onopen = () =>
+  pub.send(JSON.stringify({ thermal: { max: 68.4 }, targets: [{ label: 'Heater', value: 68.4 }] }));
 ```
 
 ## Which socket to use
 
-| Path | Who | Push | Receive | Notes |
+| Path | Who | Publish | Observe | Notes |
 |---|---|---|---|---|
-| `/ws/client` | Frontend | yes | yes | **Use this one.** |
-| `/ws/device` | ESP32-S3 | yes | no | Exclusive slot: a second device closes the first with code 4000. Push-only so the sensor never sees an echo of its own reading. |
-| `/` or `/ws/relay` | Anyone | yes | yes | Kept for the original `new WebSocket('ws://host:8080')`. Never evicts the sensor. |
+| `/ws/updates` | Anything displaying data | no | **yes** | **Use this one to display.** Read-only. |
+| `/ws/client` | Browser publisher | yes | no | Receives nothing back, not even its own pushes. |
+| `/ws/device` | ESP32-S3 | yes | no | Exclusive slot: a second device closes the first with code 4000. |
+| `/` or `/ws/relay` | Anyone | yes | yes | The one exception. Kept for the original `new WebSocket('ws://host:8080')`. Never evicts the sensor. |
 
-A message from any of these is handled identically, which is what the original
-`wss.on('message')` script did: parse JSON, normalize, store as latest, broadcast to every
-frontend socket. There is no distinction between a reading from the ESP32 and a push from a
-browser, so **any connected client can overwrite the stored value.**
+A socket either publishes or observes, never both. That is what stops a publisher from
+seeing an echo of its own message. A message from any publisher is handled identically,
+which is what the original `wss.on('message')` script did: parse JSON, normalize, store as
+latest, fan out to every observer.
+
+Because there is no distinction between a reading from the ESP32 and a push from a browser,
+**any connected publisher can overwrite the stored value.** An observer cannot: anything
+sent on `/ws/updates` is refused, and the socket is closed with code 4003.
 
 Notes:
 - Use `wss://` from an HTTPS page, or `location.origin` and swap the scheme, otherwise the
@@ -114,10 +120,10 @@ work. Nothing here needs the $5 plan unless you raise the sample rate.
 
 - `access-control-allow-origin: *` on every response, in both builds. Lock it to your
   frontend origin.
-- No authentication, and frontend sockets can now push: anyone on the internet can open
-  `/ws/client`, inject fake temperatures into your display, and disconnect the real sensor by
-  taking the `/ws/device` slot. A shared token checked in `worker/src/index.js` before routing
-  is the fix.
+- No authentication, and anyone can open a publisher socket: a stranger can inject fake
+  temperatures into your display, and anyone connecting to `/ws/device` displaces your real
+  sensor. Observers are harmless, but they are also unauthenticated. A shared token checked in
+  `worker/src/index.js` before routing is the fix.
 - The Swagger page pulls Swagger UI from unpkg, so `workers.dev` needs no extra setup. If
   you later add a custom domain and want offline docs, vendor the assets.
 - The DO name is fixed (`idFromName('thermal-relay')`), so every reader and writer shares
