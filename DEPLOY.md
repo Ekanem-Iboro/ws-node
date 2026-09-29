@@ -63,12 +63,30 @@ device sends the same JSON it always did:
 {"ts": 1790678801340, "thermal": {"max": 68.4}, "targets": [{"label": "Heater", "value": 68.4}]}
 ```
 
-Frontend:
+Frontend — this socket both **pushes and receives**:
 
 ```js
 const ws = new WebSocket('wss://ws-node.sireemmy12.workers.dev/ws/client');
+
+// receive: every accepted reading, from the ESP32 and from other frontends
 ws.onmessage = (e) => render(JSON.parse(e.data));
+
+// push: sent payloads are stored as the latest reading and broadcast to the others
+ws.send(JSON.stringify({ thermal: { max: 68.4 }, targets: [{ label: 'Heater', value: 68.4 }] }));
 ```
+
+## Which socket to use
+
+| Path | Who | Push | Receive | Notes |
+|---|---|---|---|---|
+| `/ws/client` | Frontend | yes | yes | **Use this one.** |
+| `/ws/device` | ESP32-S3 | yes | no | Exclusive slot: a second device closes the first with code 4000. Push-only so the sensor never sees an echo of its own reading. |
+| `/` or `/ws/relay` | Anyone | yes | yes | Kept for the original `new WebSocket('ws://host:8080')`. Never evicts the sensor. |
+
+A message from any of these is handled identically, which is what the original
+`wss.on('message')` script did: parse JSON, normalize, store as latest, broadcast to every
+frontend socket. There is no distinction between a reading from the ESP32 and a push from a
+browser, so **any connected client can overwrite the stored value.**
 
 Notes:
 - Use `wss://` from an HTTPS page, or `location.origin` and swap the scheme, otherwise the
@@ -96,8 +114,10 @@ work. Nothing here needs the $5 plan unless you raise the sample rate.
 
 - `access-control-allow-origin: *` on every response, in both builds. Lock it to your
   frontend origin.
-- No authentication: anyone can `POST /api/telemetry` or open a subscriber socket. Add a
-  shared token checked in `worker/src/index.js` before routing.
+- No authentication, and frontend sockets can now push: anyone on the internet can open
+  `/ws/client`, inject fake temperatures into your display, and disconnect the real sensor by
+  taking the `/ws/device` slot. A shared token checked in `worker/src/index.js` before routing
+  is the fix.
 - The Swagger page pulls Swagger UI from unpkg, so `workers.dev` needs no extra setup. If
   you later add a custom domain and want offline docs, vendor the assets.
 - The DO name is fixed (`idFromName('thermal-relay')`), so every reader and writer shares

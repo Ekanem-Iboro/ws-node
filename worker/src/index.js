@@ -7,10 +7,26 @@ export { Room };
 // Independent of the Worker name in wrangler.jsonc: this is the id of the one Durable
 // Object instance that owns the sockets. Changing it would start a fresh empty room.
 const ROOM_NAME = 'thermal-relay';
-const DEVICE_PATH = WS_PATHS.device;
-const CLIENT_PATH = WS_PATHS.client;
 // Durable Object stubs only accept absolute URLs. The host is ignored; it is not a network hop.
 const DO_ORIGIN = 'https://do.internal';
+
+// Public path -> Durable Object path. The DO serves the same path names, so this is
+// mostly an identity map; '/' is the exception, and it exists because the original script
+// was `new WebSocket('ws://host:8080')` with no path at all.
+const WS_ROLE_BY_PATH = {
+  [WS_PATHS.device]: '/ws/device',
+  [WS_PATHS.client]: '/ws/client',
+  [WS_PATHS.relay]: '/ws/relay',
+  '/': '/ws/relay',
+};
+
+// Paths that only ever answer WebSocket upgrades, so a plain GET should return 426.
+const WS_ONLY_PATHS = [WS_PATHS.device, WS_PATHS.client, WS_PATHS.relay];
+
+function wsUrlFor(pathname) {
+  const base = BASE_URL.replace(/^http/, 'ws');
+  return `${base}${pathname === '/' ? '/' : pathname}`;
+}
 
 export default {
   // This Worker is a thin router: it does no state work of its own, it forwards
@@ -23,12 +39,22 @@ export default {
       if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors() });
 
       // --- WebSockets ------------------------------------------------------
-      if ((request.headers.get('Upgrade') || '').toLowerCase() === 'websocket') {
-        if (pathname !== DEVICE_PATH && pathname !== CLIENT_PATH && pathname !== '/') {
-          return json({ error: 'Unknown WebSocket path' }, 404);
-        }
-        const target = pathname === CLIENT_PATH ? '/ws/client' : '/ws/device'; // '/' = legacy device
-        return roomStub(env).fetch(DO_ORIGIN + target, request);
+      // '/' doubles as the service-info route, so it only counts as a socket path when an
+      // upgrade header is actually present.
+      const isUpgrade = (request.headers.get('Upgrade') || '').toLowerCase() === 'websocket';
+      if (isUpgrade && WS_ROLE_BY_PATH[pathname]) {
+        return roomStub(env).fetch(DO_ORIGIN + WS_ROLE_BY_PATH[pathname], request);
+      }
+
+      // A plain GET to a socket-only path: someone opened it in a tab or hit it with curl.
+      if (!isUpgrade && WS_ONLY_PATHS.includes(pathname)) {
+        return json(
+          {
+            error: 'This endpoint requires a WebSocket upgrade',
+            hint: `Connect a WebSocket to ${url.origin}${pathname} - e.g. new WebSocket("${wsUrlFor(pathname)}"). A plain GET cannot join it.`,
+          },
+          426
+        );
       }
 
       // --- REST ------------------------------------------------------------

@@ -13,6 +13,7 @@ const { BASE_URL, WS_PATHS, deviceWsUrl, clientWsUrl } = require('./shared/confi
 const HTTP_PORT = Number(process.env.PORT) || 8080;
 const DEVICE_PATH = process.env.DEVICE_PATH || WS_PATHS.device;
 const CLIENT_PATH = process.env.CLIENT_PATH || WS_PATHS.client;
+const RELAY_PATH = WS_PATHS.relay;
 
 // --- state ---------------------------------------------------------------
 let latest = null; // most recent telemetry payload
@@ -23,16 +24,18 @@ const wsClients = new Set();
 const sseClients = new Set();
 
 // --- helpers -------------------------------------------------------------
-function logTelemetry(p) {
-  console.log(describe(p));
+function logTelemetry(p, source = 'unknown') {
+  console.log(`${describe(p)} (via ${source})`);
 }
 
-// Single fan-out point: every accepted reading goes to WS clients AND SSE clients.
-function ingest(raw) {
+// Single fan-out point: every accepted reading goes to frontend WS clients AND SSE clients.
+// The device socket is deliberately excluded so the ESP32 never sees an echo of its own
+// reading. `source` is only used for logging.
+function ingest(raw, source = 'unknown') {
   const payload = normalize(raw);
   latest = payload;
   latestAt = Date.now();
-  logTelemetry(payload);
+  logTelemetry(payload, source);
 
   const msg = JSON.stringify(payload);
   for (const ws of wsClients) {
@@ -42,6 +45,22 @@ function ingest(raw) {
     res.write(`event: telemetry\ndata: ${msg}\n\n`);
   }
   return payload;
+}
+
+// Turns a raw socket frame into an ingest call, or logs why it could not.
+function ingestFromSocket(raw, source) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    console.error(`Invalid JSON from ${source}:`, raw.slice(0, 200));
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    console.error(`Non-object payload from ${source}:`, raw.slice(0, 200));
+    return null;
+  }
+  return ingest(parsed, source);
 }
 
 // --- app -----------------------------------------------------------------
@@ -108,7 +127,12 @@ app.get('/', (req, res) => {
     local: `http://localhost:${HTTP_PORT}`,
     deployed: BASE_URL,
     rest: '/api/telemetry (GET latest, POST push), /api/health, /api/telemetry/stream (SSE)',
-    websocket: { device: DEVICE_PATH, client: CLIENT_PATH },
+    websocket: {
+      device: DEVICE_PATH,
+      client: CLIENT_PATH,
+      relay: `${RELAY_PATH} (or '/' with no path)`,
+      note: 'all sockets accept pushes; client and relay also receive the broadcast, device does not',
+    },
     deployedWebsocket: { device: deviceWsUrl(), client: clientWsUrl() },
     docs: '/api-docs',
   });
@@ -121,14 +145,29 @@ app.get('/api-docs.json', (req, res) => res.json(openapi));
 const deviceWss = new WebSocketServer({ noServer: true });
 const clientWss = new WebSocketServer({ noServer: true });
 
+const relayWss = new WebSocketServer({ noServer: true });
+
+// '/' is the path the original script used, with no path at all. On the Worker build it is
+// a relay socket that pushes and receives but never evicts the sensor; here it is a
+// separate server so the behaviour matches.
 function whichServer(pathname) {
   if (pathname === DEVICE_PATH) return deviceWss;
   if (pathname === CLIENT_PATH) return clientWss;
-  if (pathname === '/') return deviceWss; // legacy: bare host/ still means the ESP32
+  if (pathname === '/' || pathname === RELAY_PATH) return relayWss;
   return null;
 }
 
 const server = http.createServer(app);
+
+// A socket-only path opened in a browser tab or hit with curl. Answer with an explanation
+// instead of a bare 404, mirroring the Worker build.
+const WS_ONLY_PATHS = new Set([DEVICE_PATH, CLIENT_PATH, RELAY_PATH]);
+app.get([...WS_ONLY_PATHS], (req, res) => {
+  res.status(426).json({
+    error: 'This endpoint requires a WebSocket upgrade',
+    hint: `Connect a WebSocket to http://localhost:${HTTP_PORT}${req.path} - a plain GET cannot join it.`,
+  });
+});
 
 server.on('upgrade', (req, socket, head) => {
   const { pathname } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -144,14 +183,7 @@ deviceWss.on('connection', (ws) => {
   deviceConnected = true;
   console.log('ESP32-S3 Connected!');
 
-  ws.on('message', (data) => {
-    const raw = data.toString();
-    try {
-      ingest(JSON.parse(raw));
-    } catch (err) {
-      console.error('Invalid JSON from ESP32-S3:', raw);
-    }
-  });
+  ws.on('message', (data) => ingestFromSocket(data.toString(), 'ESP32-S3 socket'));
 
   ws.on('close', () => {
     deviceConnected = false;
@@ -160,19 +192,30 @@ deviceWss.on('connection', (ws) => {
   ws.on('error', (err) => console.error('ESP32-S3 error:', err.message));
 });
 
-clientWss.on('connection', (ws) => {
-  wsClients.add(ws);
-  console.log(`Frontend connected (${wsClients.size} total).`);
+// Frontend sockets both push and receive. ws.send(...) from a browser is ingested exactly
+// like a reading from the ESP32, then broadcast to every other frontend. '/' behaves the
+// same way, which is what the original bare-host script did.
+function registerFrontendSocket(wss, label) {
+  wss.on('connection', (ws) => {
+    wsClients.add(ws);
+    console.log(`${label} connected (${wsClients.size} total).`);
 
-  ws.on('message', (msg) => console.log('From client:', msg.toString()));
-  ws.on('close', () => {
-    wsClients.delete(ws);
-    console.log(`Frontend disconnected (${wsClients.size} total).`);
+    // Replay the stored reading so a page renders before the next sample arrives.
+    if (latest) ws.send(JSON.stringify(latest));
+
+    ws.on('message', (msg) => ingestFromSocket(msg.toString(), `${label} socket`));
+    ws.on('close', () => {
+      wsClients.delete(ws);
+      console.log(`${label} disconnected (${wsClients.size} total).`);
+    });
+    ws.on('error', (err) => console.error(`${label} error:`, err.message));
   });
-  ws.on('error', (err) => console.error('Client error:', err.message));
-});
+}
 
-for (const [name, wss] of [['Device', deviceWss], ['Client', clientWss]]) {
+registerFrontendSocket(clientWss, 'Frontend');
+registerFrontendSocket(relayWss, 'Relay client');
+
+for (const [name, wss] of [['Device', deviceWss], ['Client', clientWss], ['Relay', relayWss]]) {
   wss.on('error', (err) => console.error(`${name} server error:`, err.message));
 }
 

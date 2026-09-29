@@ -5,8 +5,13 @@ export const BASE_URL = 'https://ws-node.sireemmy12.workers.dev';
 // WebSocket routes are path-based on every runtime: local Node, wrangler dev, and Cloudflare.
 export const WS_PATHS = {
   device: '/ws/device', // ESP32-S3 pushes telemetry here
-  client: '/ws/client', // frontend subscribes here
+  client: '/ws/client', // frontend subscribes and pushes here
+  relay: '/ws/relay', // same, under an explicit name
 };
+
+// The bare '/' path also accepts an upgrade, because the original script connected to the
+// host root with no path. It is a relay socket: it never evicts the device slot.
+export const ROOT_WS_PATH = '/';
 
 export const deviceWsUrl = (base = BASE_URL) =>
   `${base.replace(/^http/, 'ws')}${WS_PATHS.device}`;

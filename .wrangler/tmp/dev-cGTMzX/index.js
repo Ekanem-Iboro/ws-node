@@ -31,6 +31,11 @@ __name(describe, "describe");
 
 // worker/src/room.js
 var LAST_KEY = "telemetry:latest";
+var ROLES = {
+  device: { receivesBroadcast: false },
+  client: { receivesBroadcast: true },
+  relay: { receivesBroadcast: true }
+};
 var Room = class extends DurableObject {
   static {
     __name(this, "Room");
@@ -51,6 +56,8 @@ var Room = class extends DurableObject {
         return this.acceptSocket(request, "device");
       case "/ws/client":
         return this.acceptSocket(request, "client");
+      case "/ws/relay":
+        return this.acceptSocket(request, "relay");
       case "/ingest":
         return request.method === "POST" ? this.ingestViaHttp(request) : json({ error: "Method not allowed" }, 405);
       case "/latest":
@@ -60,7 +67,11 @@ var Room = class extends DurableObject {
           status: "ok",
           runtime: "cloudflare-worker",
           deviceConnected: this.ctx.getWebSockets("device").length > 0,
-          subscribers: { websocket: this.ctx.getWebSockets("client").length, sse: 0 },
+          subscribers: {
+            websocket: this.subscriberCount(),
+            device: this.ctx.getWebSockets("device").length,
+            sse: 0
+          },
           latestAt: this.latestAt
         });
       default:
@@ -70,7 +81,13 @@ var Room = class extends DurableObject {
   // --- sockets ------------------------------------------------------------
   acceptSocket(request, role) {
     if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") {
-      return json({ error: "Expected a WebSocket upgrade" }, 426);
+      return json(
+        {
+          error: "This endpoint requires a WebSocket upgrade",
+          hint: 'Connect a WebSocket to this path, e.g. new WebSocket("wss://<host>/ws/client"). A plain HTTP GET cannot join it.'
+        },
+        426
+      );
     }
     if (role === "device") {
       for (const ws of this.ctx.getWebSockets("device")) {
@@ -80,12 +97,8 @@ var Room = class extends DurableObject {
     const [client, server] = Object.values(new WebSocketPair());
     this.ctx.acceptWebSocket(server, [role]);
     server.serializeAttachment({ role, connectedAt: Date.now() });
-    if (role === "client") {
-      console.log(`Frontend connected (${this.ctx.getWebSockets("client").length} total).`);
-      if (this.latest) server.send(JSON.stringify(this.latest));
-    } else {
-      console.log("ESP32-S3 Connected!");
-    }
+    console.log(`${LABELS[role]} connected.`);
+    if (ROLES[role].receivesBroadcast && this.latest) server.send(JSON.stringify(this.latest));
     return new Response(null, { status: 101, webSocket: client });
   }
   // --- ingest -------------------------------------------------------------
@@ -102,16 +115,27 @@ var Room = class extends DurableObject {
     const { payload } = await this.ingest(raw);
     return json({ accepted: true, ts: payload.ts }, 202);
   }
-  // The single fan-out point: every accepted reading, from either transport, ends here.
-  async ingest(raw) {
+  // Every socket that receives the broadcast: the frontends, not the sensor (so the ESP32
+  // never sees an echo of its own reading).
+  broadcastTargets() {
+    return [
+      ...this.ctx.getWebSockets("client"),
+      ...this.ctx.getWebSockets("relay")
+    ];
+  }
+  subscriberCount() {
+    return this.broadcastTargets().length;
+  }
+  // The single fan-out point: every accepted reading, from any socket or from HTTP, ends here.
+  async ingest(raw, source = "unknown") {
     const payload = normalize(raw);
     this.latest = payload;
     this.latestAt = Date.now();
     await this.ctx.storage.put(LAST_KEY, { data: payload, at: this.latestAt });
-    console.log(describe(payload));
+    console.log(`${describe(payload)} (via ${source})`);
     const msg = JSON.stringify(payload);
     let notified = 0;
-    for (const ws of this.ctx.getWebSockets("client")) {
+    for (const ws of this.broadcastTargets()) {
       try {
         ws.send(msg);
         notified++;
@@ -121,34 +145,44 @@ var Room = class extends DurableObject {
     return { payload, notified };
   }
   // --- hibernation event handlers ----------------------------------------
+  // Push path. Any role may send: the ESP32 and the frontend are treated identically,
+  // which is what the original `wss.on('message')` script did.
   async webSocketMessage(ws, message) {
     const { role } = ws.deserializeAttachment() ?? {};
-    if (role !== "device") return;
     const raw = typeof message === "string" ? message : new TextDecoder().decode(message);
     let parsed;
     try {
       parsed = JSON.parse(raw);
     } catch {
-      console.error("Invalid JSON from ESP32-S3:", raw.slice(0, 200));
+      console.error(`Invalid JSON from ${LABELS[role] ?? "socket"}:`, raw.slice(0, 200));
       return;
     }
-    await this.ingest(parsed);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      console.error(`Non-object payload from ${LABELS[role] ?? "socket"}:`, raw.slice(0, 200));
+      return;
+    }
+    await this.ingest(parsed, `${LABELS[role] ?? "socket"} socket`);
   }
   async webSocketClose(ws, code) {
     const { role } = ws.deserializeAttachment() ?? {};
     if (code >= 1e3 && code <= 4999 && code !== 1005 && code !== 1006) {
       ws.close(code, "closing");
     }
-    if (role === "device") console.log("ESP32-S3 Disconnected.");
-    else {
-      const remaining = Math.max(0, this.ctx.getWebSockets("client").length - 1);
-      console.log(`Frontend disconnected (${remaining} total).`);
+    if (ROLES[role]?.receivesBroadcast) {
+      console.log(`${LABELS[role]} disconnected (${Math.max(0, this.subscriberCount() - 1)} total).`);
+    } else {
+      console.log(`${LABELS[role] ?? "Socket"} disconnected.`);
     }
   }
   async webSocketError(ws, error) {
     const { role } = ws.deserializeAttachment() ?? {};
-    console.error(`${role ?? "client"} socket error:`, error?.message ?? error);
+    console.error(`${LABELS[role] ?? "Socket"} error:`, error?.message ?? error);
   }
+};
+var LABELS = {
+  device: "ESP32-S3",
+  client: "Frontend",
+  relay: "Relay client"
 };
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -163,13 +197,44 @@ var BASE_URL = "https://ws-node.sireemmy12.workers.dev";
 var WS_PATHS = {
   device: "/ws/device",
   // ESP32-S3 pushes telemetry here
-  client: "/ws/client"
-  // frontend subscribes here
+  client: "/ws/client",
+  // frontend subscribes and pushes here
+  relay: "/ws/relay"
+  // same, under an explicit name
 };
 var deviceWsUrl = /* @__PURE__ */ __name((base = BASE_URL) => `${base.replace(/^http/, "ws")}${WS_PATHS.device}`, "deviceWsUrl");
 var clientWsUrl = /* @__PURE__ */ __name((base = BASE_URL) => `${base.replace(/^http/, "ws")}${WS_PATHS.client}`, "clientWsUrl");
 
 // shared/openapi.mjs
+function wsOperation({ summary, url, role, sends, receives, example, tags = ["websocket"], notes = [] }) {
+  return {
+    get: {
+      tags,
+      summary,
+      description: [
+        `**Full URL:** \`${url}\``,
+        "",
+        role,
+        "",
+        `**Send:** ${sends}`,
+        "",
+        `**Receive:** ${receives}`,
+        "",
+        "```js",
+        example,
+        "```",
+        "",
+        ...notes.flatMap((n) => [`- ${n}`, ""]),
+        'This is a WebSocket upgrade, so "Try it out" does not apply: a plain GET returns `426 Upgrade Required`.'
+      ].join("\n"),
+      responses: {
+        101: { description: "Switching Protocols - the socket is open" },
+        426: { description: "Upgrade Required - this endpoint only speaks WebSocket" }
+      }
+    }
+  };
+}
+__name(wsOperation, "wsOperation");
 var openapi_default = {
   openapi: "3.0.3",
   info: {
@@ -178,11 +243,26 @@ var openapi_default = {
     description: [
       "Relay between an ESP32-S3 thermal sensor and a web frontend.",
       "",
+      "### The frontend pushes too",
+      "`/ws/client` is bidirectional. The browser sends a payload and it is ingested exactly like a reading from the ESP32:",
+      "stored as the latest value and broadcast to every other frontend socket. This mirrors the original",
+      "`wss.on('message')` script, which never distinguished who sent what.",
+      "",
+      "```js",
+      "const ws = new WebSocket('" + clientWsUrl() + "');",
+      "ws.onmessage = (e) => render(JSON.parse(e.data));",
+      "ws.send(JSON.stringify({ thermal: { max: 68.4 }, targets: [{ label: 'Heater', value: 68.4 }] }));",
+      "```",
+      "",
       "### Data flow",
-      "1. The ESP32-S3 pushes a telemetry reading, either over a WebSocket (`ws://host/ws/device`) or an HTTP POST (`POST /api/telemetry`).",
-      "2. The server normalizes it, stores it as the latest reading, and fans it out to every subscriber.",
-      "3. Subscribers are WebSocket clients (`ws://host/ws/client`) or Server-Sent Event subscribers (`GET /api/telemetry/stream`).",
-      "4. A frontend that cannot hold a connection reads the latest value with `GET /api/telemetry`.",
+      "1. A reading arrives from the ESP32-S3 (`/ws/device`), from the frontend (`/ws/client`), or from an HTTP POST (`POST /api/telemetry`).",
+      "2. The server normalizes it, stores it as the latest reading, and fans it out to every frontend socket and SSE subscriber.",
+      "3. Frontends receive them on `/ws/client`, or read the latest value with `GET /api/telemetry` when they cannot hold a connection.",
+      "",
+      "### Which socket to use",
+      "- `/ws/client` - the frontend. Pushes **and** receives. Use this one.",
+      "- `/ws/device` - the ESP32-S3. Pushes, does not receive, so the sensor never sees an echo. Exclusive: a new device socket closes the previous one with code 4000.",
+      "- `/` - a relay socket, kept for compatibility with the original `new WebSocket('ws://host:8080')`. Pushes and receives, and never evicts the sensor.",
       "",
       "### Hosting notes",
       "The Cloudflare Worker build (`worker/`) routes everything through one Durable Object named `thermal-relay`, which owns the client sockets and the stored reading so fan-out survives multiple isolates. On Workers the SSE endpoint is not available (it would pin a live isolate); use the WebSocket there."
@@ -194,6 +274,7 @@ var openapi_default = {
     { url: BASE_URL, description: "Cloudflare Workers (deployed)" }
   ],
   tags: [
+    { name: "websocket", description: "WebSocket endpoints: the ESP32-S3 and the frontend both push here" },
     { name: "telemetry", description: "Thermal readings pushed by the device and read by the frontend" },
     { name: "health", description: "Server and connection status" }
   ],
@@ -272,6 +353,28 @@ var openapi_default = {
         }
       }
     },
+    "/ws/client": wsOperation({
+      summary: "Frontend socket: push and receive telemetry",
+      url: clientWsUrl(),
+      role: "Browser frontend. Sends a payload to publish it, and receives every accepted reading.",
+      sends: "Anything with a `thermal` field is stored as the latest reading and broadcast to all other frontend sockets.",
+      receives: "Every accepted reading. The stored reading is replayed on connect.",
+      example: "const ws = new WebSocket('" + clientWsUrl() + "');\nws.onmessage = (e) => render(JSON.parse(e.data));\nws.send(JSON.stringify({ thermal: { max: 68.4 }, targets: [{ label: 'Heater', value: 68.4 }] }));",
+      tags: ["websocket"]
+    }),
+    "/ws/device": wsOperation({
+      summary: "ESP32-S3 socket: push telemetry",
+      url: deviceWsUrl(),
+      role: "The sensor. Sends readings; does not receive the broadcast, so it never sees an echo of its own data.",
+      sends: 'A telemetry object: { "ts": <ms>, "thermal": { "max": <number> }, "targets": [ { "label": "...", "value": <number> } ] }',
+      receives: "Nothing. Device sockets are push-only.",
+      example: '// ESP32 / Arduino\nWebSocketClient ws("' + deviceWsUrl() + '");\nws.connect();\nws.println("{\\"ts\\":" + millis() + ",\\"thermal\\":{\\"max\\":68.4}}");',
+      tags: ["websocket"],
+      notes: [
+        "Connecting a second device socket closes the first with code 4000, so the sensor slot stays exclusive.",
+        "A bare upgrade to / is accepted as a general relay socket and does not evict the device."
+      ]
+    }),
     "/api/telemetry/stream": {
       get: {
         tags: ["telemetry"],
@@ -314,29 +417,32 @@ var openapi_default = {
       }
     }
   },
+  // Machine-readable mirror of the websocket entries in `paths`. Swagger UI ignores
+  // vendor extensions, which is why those same endpoints are also declared in `paths`.
   "x-websocket": {
-    note: 'OpenAPI cannot describe WebSocket handshakes; documented here for reference. There is no "Try it out" for these - use a WS client, or use the REST endpoints instead.',
+    note: "WebSocket endpoints are declared under `paths` as GET operations with a 101 response, because vendor extensions are not rendered by Swagger UI. This block is the machine-readable duplicate.",
     endpoints: {
-      "/ws/device": {
-        method: "GET (HTTP Upgrade)",
-        url: deviceWsUrl(),
-        role: "ESP32-S3 pushes telemetry",
-        serverHandshake: "101 Switching Protocols",
-        send: { example: '{"ts":1790678801340,"thermal":{"max":68.4},"targets":[{"label":"Heater","value":68.4}]}' },
-        receives: "Nothing meaningful; client sockets are read-only subscribers.",
-        notes: [
-          "Legacy: on the Node server a bare upgrade to / is still accepted as the device endpoint.",
-          "On Cloudflare, connecting a second device closes the first one (code 4000)."
-        ]
-      },
       "/ws/client": {
-        method: "GET (HTTP Upgrade)",
         url: clientWsUrl(),
-        role: "Frontend subscribes to telemetry",
-        serverHandshake: "101 Switching Protocols",
-        receives: "Every accepted telemetry payload, as JSON text. The latest reading is replayed on connect.",
-        browserExample: `const ws = new WebSocket('${clientWsUrl()}');
-ws.onmessage = (e) => console.log(JSON.parse(e.data));`
+        role: "Frontend",
+        bidirectional: true,
+        sends: "Telemetry object; stored as latest and broadcast to other frontends.",
+        receives: "Every accepted reading; the stored reading is replayed on connect."
+      },
+      "/ws/device": {
+        url: deviceWsUrl(),
+        role: "ESP32-S3",
+        bidirectional: false,
+        sends: "Telemetry object.",
+        receives: "Nothing. Exclusive slot: a second device closes the first with code 4000."
+      },
+      "/": {
+        url: BASE_URL.replace(/^http/, "ws") + "/",
+        role: "Relay (legacy path from the original script)",
+        bidirectional: true,
+        sends: "Telemetry object.",
+        receives: "Every accepted reading.",
+        note: "Never evicts the device socket."
       }
     }
   }
@@ -344,9 +450,19 @@ ws.onmessage = (e) => console.log(JSON.parse(e.data));`
 
 // worker/src/index.js
 var ROOM_NAME = "thermal-relay";
-var DEVICE_PATH = WS_PATHS.device;
-var CLIENT_PATH = WS_PATHS.client;
 var DO_ORIGIN = "https://do.internal";
+var WS_ROLE_BY_PATH = {
+  [WS_PATHS.device]: "/ws/device",
+  [WS_PATHS.client]: "/ws/client",
+  [WS_PATHS.relay]: "/ws/relay",
+  "/": "/ws/relay"
+};
+var WS_ONLY_PATHS = [WS_PATHS.device, WS_PATHS.client, WS_PATHS.relay];
+function wsUrlFor(pathname) {
+  const base = BASE_URL.replace(/^http/, "ws");
+  return `${base}${pathname === "/" ? "/" : pathname}`;
+}
+__name(wsUrlFor, "wsUrlFor");
 var src_default = {
   // This Worker is a thin router: it does no state work of its own, it forwards
   // everything to the one Durable Object instance that owns the sockets.
@@ -355,12 +471,18 @@ var src_default = {
     const { pathname } = url;
     try {
       if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors() });
-      if ((request.headers.get("Upgrade") || "").toLowerCase() === "websocket") {
-        if (pathname !== DEVICE_PATH && pathname !== CLIENT_PATH && pathname !== "/") {
-          return json2({ error: "Unknown WebSocket path" }, 404);
-        }
-        const target = pathname === CLIENT_PATH ? "/ws/client" : "/ws/device";
-        return roomStub(env).fetch(DO_ORIGIN + target, request);
+      const isUpgrade = (request.headers.get("Upgrade") || "").toLowerCase() === "websocket";
+      if (isUpgrade && WS_ROLE_BY_PATH[pathname]) {
+        return roomStub(env).fetch(DO_ORIGIN + WS_ROLE_BY_PATH[pathname], request);
+      }
+      if (!isUpgrade && WS_ONLY_PATHS.includes(pathname)) {
+        return json2(
+          {
+            error: "This endpoint requires a WebSocket upgrade",
+            hint: `Connect a WebSocket to ${url.origin}${pathname} - e.g. new WebSocket("${wsUrlFor(pathname)}"). A plain GET cannot join it.`
+          },
+          426
+        );
       }
       if (pathname === "/api/telemetry" && request.method === "POST") {
         const body = await readJson(request);
@@ -512,7 +634,7 @@ var jsonError = /* @__PURE__ */ __name(async (request, env, _ctx, middlewareCtx)
 }, "jsonError");
 var middleware_miniflare3_json_error_default = jsonError;
 
-// .wrangler/tmp/bundle-A5EWUK/middleware-insertion-facade.js
+// .wrangler/tmp/bundle-VTiiZv/middleware-insertion-facade.js
 var __INTERNAL_WRANGLER_MIDDLEWARE__ = [
   middleware_ensure_req_body_drained_default,
   middleware_miniflare3_json_error_default
@@ -544,7 +666,7 @@ function __facade_invoke__(request, env, ctx, dispatch, finalMiddleware) {
 }
 __name(__facade_invoke__, "__facade_invoke__");
 
-// .wrangler/tmp/bundle-A5EWUK/middleware-loader.entry.ts
+// .wrangler/tmp/bundle-VTiiZv/middleware-loader.entry.ts
 var __Facade_ScheduledController__ = class ___Facade_ScheduledController__ {
   constructor(scheduledTime, cron, noRetry) {
     this.scheduledTime = scheduledTime;
