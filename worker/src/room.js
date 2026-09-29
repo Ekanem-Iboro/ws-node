@@ -3,6 +3,13 @@ import { normalize, describe } from '../../shared/telemetry.mjs';
 
 const LAST_KEY = 'telemetry:latest';
 
+// How often the stored reading is refreshed. Persisting every single reading costs one
+// billed row write each, which the Workers Free plan caps at 100,000 rows/day - a 1 Hz
+// device would use that in a little over a day. The in-memory value is always current, so
+// persistence is only a safety net for when this object gets evicted, not the source of
+// truth. This interval keeps a 1 Hz device at ~5,700 rows/day instead of 86,400.
+const PERSIST_INTERVAL_MS = 15_000;
+
 // Roles decide what a socket may do. A socket either publishes or observes, never both.
 //   device  - ESP32-S3. Publishes only. Does not receive (no echo of its own reading).
 //   client  - browser publisher. Publishes only; its own pushes do not come back to it.
@@ -23,11 +30,23 @@ export class Room extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.ctx = ctx;
+    this.latest = null;
+    this.latestAt = null;
+    this.lastPersistedAt = 0;
+    this.persistenceFailed = false;
     // Constructor must stay cheap: it re-runs every time the object wakes from hibernation.
+    // Never let a storage failure here reject the constructor, or every later request on
+    // this object fails too - including plain reads that need no storage at all.
     this.ctx.blockConcurrencyWhile(async () => {
-      const stored = await this.ctx.storage.get(LAST_KEY);
-      this.latest = stored?.data ?? null;
-      this.latestAt = stored?.at ?? null;
+      try {
+        const stored = await this.ctx.storage.get(LAST_KEY);
+        this.latest = stored?.data ?? null;
+        this.latestAt = stored?.at ?? null;
+        this.lastPersistedAt = stored?.at ?? 0;
+      } catch (err) {
+        this.persistenceFailed = true;
+        console.error('Could not restore the stored reading; starting empty.', err?.message ?? err);
+      }
     });
   }
 
@@ -62,6 +81,13 @@ export class Room extends DurableObject {
             sse: 0,
           },
           latestAt: this.latestAt,
+          // Reads stay served from memory even when storage is refusing writes, so this
+          // flag is informational: degraded means "not persisted", not "broken".
+          persistence: {
+            degraded: this.persistenceFailed,
+            lastPersistedAt: this.lastPersistedAt || null,
+            intervalMs: PERSIST_INTERVAL_MS,
+          },
         });
       default:
         return json({ error: 'Not found' }, 404);
@@ -136,7 +162,9 @@ export class Room extends DurableObject {
     this.latest = payload;
     this.latestAt = Date.now();
 
-    await this.ctx.storage.put(LAST_KEY, { data: payload, at: this.latestAt });
+    // Best-effort and throttled. A storage failure must never stop the reading from
+    // reaching the observers, so this is deliberately not awaited into the critical path.
+    void this.persist(payload, this.latestAt);
     console.log(`${describe(payload)} (via ${source})`);
 
     const msg = JSON.stringify(payload);
@@ -150,6 +178,32 @@ export class Room extends DurableObject {
       }
     }
     return { payload, notified };
+  }
+
+  // Writes the current reading to storage, at most once per PERSIST_INTERVAL_MS. Resolves
+  // rather than rejects on failure: the free tier can refuse a write once the daily row
+  // budget is spent, and that must degrade to "not persisted" instead of "relay broken".
+  async persist(payload, at) {
+    if (at - this.lastPersistedAt < PERSIST_INTERVAL_MS) return false;
+    try {
+      await this.ctx.storage.put(LAST_KEY, { data: payload, at });
+      this.lastPersistedAt = at;
+      if (this.persistenceFailed) {
+        this.persistenceFailed = false;
+        console.log('Storage writes working again.');
+      }
+      return true;
+    } catch (err) {
+      // Leave lastPersistedAt alone so the next reading retries immediately.
+      if (!this.persistenceFailed) {
+        this.persistenceFailed = true;
+        console.error(
+          `Storage write refused (${err?.message ?? err}). Readings still flow to observers, ` +
+            'but this last value will be lost if the object is evicted.'
+        );
+      }
+      return false;
+    }
   }
 
   // --- hibernation event handlers ----------------------------------------

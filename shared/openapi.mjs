@@ -121,6 +121,16 @@ export default {
                       },
                     },
                     latestAt: { type: 'integer', nullable: true, description: 'Epoch ms of last reading' },
+                    persistence: {
+                      type: 'object',
+                      description:
+                        'Durable Object storage status. The current reading is always served from memory, so `degraded` only means the last value is not persisted, not that the relay is down.',
+                      properties: {
+                        degraded: { type: 'boolean', description: 'True when storage writes are being refused (Free plan row budget spent). Resets 00:00 UTC.' },
+                        lastPersistedAt: { type: 'integer', nullable: true, description: 'Epoch ms of the last successful write' },
+                        intervalMs: { type: 'integer', example: 15000, description: 'Throttle between storage writes' },
+                      },
+                    },
                   },
                 },
               },

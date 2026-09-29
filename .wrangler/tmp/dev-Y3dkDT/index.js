@@ -31,6 +31,7 @@ __name(describe, "describe");
 
 // worker/src/room.js
 var LAST_KEY = "telemetry:latest";
+var PERSIST_INTERVAL_MS = 15e3;
 var ROLES = {
   device: { publishes: true, receivesBroadcast: false },
   client: { publishes: true, receivesBroadcast: false },
@@ -44,10 +45,20 @@ var Room = class extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.ctx = ctx;
+    this.latest = null;
+    this.latestAt = null;
+    this.lastPersistedAt = 0;
+    this.persistenceFailed = false;
     this.ctx.blockConcurrencyWhile(async () => {
-      const stored = await this.ctx.storage.get(LAST_KEY);
-      this.latest = stored?.data ?? null;
-      this.latestAt = stored?.at ?? null;
+      try {
+        const stored = await this.ctx.storage.get(LAST_KEY);
+        this.latest = stored?.data ?? null;
+        this.latestAt = stored?.at ?? null;
+        this.lastPersistedAt = stored?.at ?? 0;
+      } catch (err) {
+        this.persistenceFailed = true;
+        console.error("Could not restore the stored reading; starting empty.", err?.message ?? err);
+      }
     });
   }
   async fetch(request) {
@@ -80,7 +91,14 @@ var Room = class extends DurableObject {
             relay: this.ctx.getWebSockets("relay").length,
             sse: 0
           },
-          latestAt: this.latestAt
+          latestAt: this.latestAt,
+          // Reads stay served from memory even when storage is refusing writes, so this
+          // flag is informational: degraded means "not persisted", not "broken".
+          persistence: {
+            degraded: this.persistenceFailed,
+            lastPersistedAt: this.lastPersistedAt || null,
+            intervalMs: PERSIST_INTERVAL_MS
+          }
         });
       default:
         return json({ error: "Not found" }, 404);
@@ -139,7 +157,7 @@ var Room = class extends DurableObject {
     const payload = normalize(raw);
     this.latest = payload;
     this.latestAt = Date.now();
-    await this.ctx.storage.put(LAST_KEY, { data: payload, at: this.latestAt });
+    void this.persist(payload, this.latestAt);
     console.log(`${describe(payload)} (via ${source})`);
     const msg = JSON.stringify(payload);
     let notified = 0;
@@ -151,6 +169,29 @@ var Room = class extends DurableObject {
       }
     }
     return { payload, notified };
+  }
+  // Writes the current reading to storage, at most once per PERSIST_INTERVAL_MS. Resolves
+  // rather than rejects on failure: the free tier can refuse a write once the daily row
+  // budget is spent, and that must degrade to "not persisted" instead of "relay broken".
+  async persist(payload, at) {
+    if (at - this.lastPersistedAt < PERSIST_INTERVAL_MS) return false;
+    try {
+      await this.ctx.storage.put(LAST_KEY, { data: payload, at });
+      this.lastPersistedAt = at;
+      if (this.persistenceFailed) {
+        this.persistenceFailed = false;
+        console.log("Storage writes working again.");
+      }
+      return true;
+    } catch (err) {
+      if (!this.persistenceFailed) {
+        this.persistenceFailed = true;
+        console.error(
+          `Storage write refused (${err?.message ?? err}). Readings still flow to observers, but this last value will be lost if the object is evicted.`
+        );
+      }
+      return false;
+    }
   }
   // --- hibernation event handlers ----------------------------------------
   // Publish path. A socket whose role allows publishing is ingested exactly like the
@@ -339,7 +380,16 @@ var openapi_default = {
                         sse: { type: "integer", description: "Always 0 on Cloudflare, which does not support SSE" }
                       }
                     },
-                    latestAt: { type: "integer", nullable: true, description: "Epoch ms of last reading" }
+                    latestAt: { type: "integer", nullable: true, description: "Epoch ms of last reading" },
+                    persistence: {
+                      type: "object",
+                      description: "Durable Object storage status. The current reading is always served from memory, so `degraded` only means the last value is not persisted, not that the relay is down.",
+                      properties: {
+                        degraded: { type: "boolean", description: "True when storage writes are being refused (Free plan row budget spent). Resets 00:00 UTC." },
+                        lastPersistedAt: { type: "integer", nullable: true, description: "Epoch ms of the last successful write" },
+                        intervalMs: { type: "integer", example: 15e3, description: "Throttle between storage writes" }
+                      }
+                    }
                   }
                 }
               }
